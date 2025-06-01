@@ -2,6 +2,7 @@ void child_chat_loop(const char *channel_name, int read_fd, int initially_muted)
     int muted = initially_muted;
     srand(getpid());
 
+    // Set up log file
     char filename[256];
     snprintf(filename, sizeof(filename), "%s.log", channel_name + 1);
     FILE *logfile = fopen(filename, "a");
@@ -10,6 +11,7 @@ void child_chat_loop(const char *channel_name, int read_fd, int initially_muted)
         exit(1);
     }
 
+    // Find channel index
     int channel_index = -1;
     for (int i = 0; i < channel_count; i++) {
         if (strcmp(channels[i].name, channel_name) == 0) {
@@ -17,6 +19,7 @@ void child_chat_loop(const char *channel_name, int read_fd, int initially_muted)
             break;
         }
     }
+    
     if (channel_index >= 0 && strcmp(channels[channel_index].name, ADMIN_CHANNEL) != 0) {
         load_responses_for_channel(channel_index);
     }
@@ -28,46 +31,114 @@ void child_chat_loop(const char *channel_name, int read_fd, int initially_muted)
         if (n > 0) {
             line[n] = '\0';
 
-            // MUTE / UNMUTE
+            // MUTE/UNMUTE COMMANDS
             if (strstr(line, "unmute_command_internal") && strstr(line, channel_name)) {
                 muted = 0;
                 printf("[UNMUTE] Child of %s received unmute command\n", channel_name);
                 continue;
-          }
+            }
             if (strstr(line, "mute_command_internal") && strstr(line, channel_name)) {
                 muted = 1;
                 printf("[MUTE] Child of %s received mute command\n", channel_name);
                 continue;
             }
 
-            // ADMIN KOMANDOS: mute/unmute/ignore/unignore
+            // IGNORE COMMANDS
+            if (strncmp(line, "ignore_command_internal ", 24) == 0) {
+                char user_to_ignore[MAX_NAME_LEN];
+                sscanf(line + 24, "%127[^\n]", user_to_ignore);
+                user_to_ignore[strcspn(user_to_ignore, "\r\n")] = '\0';
+                
+                if (channel_index >= 0 && channels[channel_index].ignored_count < MAX_IGNORED_USERS) {
+                    strncpy(channels[channel_index].ignored_users[channels[channel_index].ignored_count++], 
+                           user_to_ignore, MAX_NAME_LEN);
+                    printf("[IGNORE-LOCAL] %s now ignored in %s (total: %d)\n", 
+                           user_to_ignore, channel_name, channels[channel_index].ignored_count);
+                }
+                continue;
+            }
+
+            // UNIGNORE COMMANDS
+            if (strncmp(line, "unignore_command_internal ", 26) == 0) {
+                char user_to_unignore[MAX_NAME_LEN];
+                sscanf(line + 26, "%127[^\n]", user_to_unignore);
+                user_to_unignore[strcspn(user_to_unignore, "\r\n")] = '\0';
+
+                if (channel_index >= 0) {
+                    int found = 0;
+                    for (int i = 0; i < channels[channel_index].ignored_count; i++) {
+                        if (strcmp(channels[channel_index].ignored_users[i], user_to_unignore) == 0) {
+                            for (int j = i; j < channels[channel_index].ignored_count - 1; j++) {
+                                strncpy(channels[channel_index].ignored_users[j], 
+                                       channels[channel_index].ignored_users[j + 1], MAX_NAME_LEN);
+                            }
+                            channels[channel_index].ignored_count--;
+                            found = 1;
+                            printf("[UNIGNORE-LOCAL] %s no longer ignored in %s\n", 
+                                   user_to_unignore, channel_name);
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        printf("[UNIGNORE-LOCAL] %s was not ignored in %s\n", 
+                               user_to_unignore, channel_name);
+                    }
+                }
+                continue;
+            }
+
+            // ADMIN COMMANDS
             if (strstr(channel_name, ADMIN_CHANNEL) != NULL) {
                 char target[MAX_NAME_LEN], command[MAX_NAME_LEN], user_to_ignore[MAX_NAME_LEN];
-                if (sscanf(line, ":%*[^!]!%*[^@]@%*s PRIVMSG %*s :#%s %s %s", target, command, user_to_ignore) >= 2) {
+                if (sscanf(line, ":%*[^!]!%*[^@]@%*s PRIVMSG %*s :#%s %s %s", 
+                          target, command, user_to_ignore) >= 2) {
+                    user_to_ignore[strcspn(user_to_ignore, "\r\n")] = '\0';
+                    
                     for (int i = 0; i < channel_count; i++) {
                         if (strcmp(channels[i].name + 1, target) == 0) {
                             Channel *ch = &channels[i];
+                            
                             if (strcmp(command, "mute") == 0) {
                                 char cmd[128];
                                 snprintf(cmd, sizeof(cmd), "mute_command_internal #%s\n", target);
                                 write(pipes[i][1], cmd, strlen(cmd));
                                 printf("[MUTE] Sent mute command to #%s\n", target);
-                            } else if (strcmp(command, "unmute") == 0) {
+                            }
+                            else if (strcmp(command, "unmute") == 0) {
                                 char cmd[128];
                                 snprintf(cmd, sizeof(cmd), "unmute_command_internal #%s\n", target);
                                 write(pipes[i][1], cmd, strlen(cmd));
                                 printf("[UNMUTE] Sent unmute command to #%s\n", target);
-                            } else if (strcmp(command, "ignore") == 0 && ch->ignored_count < MAX_IGNORED_USERS) {
+                            }
+                            else if (strcmp(command, "ignore") == 0 && ch->ignored_count < MAX_IGNORED_USERS) {
                                 strncpy(ch->ignored_users[ch->ignored_count++], user_to_ignore, MAX_NAME_LEN);
                                 printf("[IGNORE] %s now ignored in #%s\n", user_to_ignore, target);
-                            } else if (strcmp(command, "unignore") == 0) {
+                                
+                                char cmd[128];
+                                snprintf(cmd, sizeof(cmd), "ignore_command_internal %s\n", user_to_ignore);
+                                int bytes_written = write(pipes[i][1], cmd, strlen(cmd));
+                                if (bytes_written < 0) {
+                                    perror("Failed to write ignore command to pipe");
+                                } else {
+                                    printf("[PIPE] Sent %d bytes to pipe %d: %s", 
+                                           bytes_written, pipes[i][1], cmd);
+                                }
+                                fsync(pipes[i][1]);
+                            }
+                            else if (strcmp(command, "unignore") == 0) {
                                 for (int j = 0; j < ch->ignored_count; j++) {
                                     if (strcmp(ch->ignored_users[j], user_to_ignore) == 0) {
                                         for (int k = j; k < ch->ignored_count - 1; k++) {
-                                            strncpy(ch->ignored_users[k], ch->ignored_users[k + 1], MAX_NAME_LEN);
+                                            strncpy(ch->ignored_users[k], 
+                                                   ch->ignored_users[k + 1], MAX_NAME_LEN);
                                         }
                                         ch->ignored_count--;
-                                        printf("[UNIGNORE] %s no longer ignored in #%s\n", user_to_ignore, target);
+                                        printf("[UNIGNORE] %s no longer ignored in #%s\n", 
+                                               user_to_ignore, target);
+                                        
+                                        char cmd[128];
+                                        snprintf(cmd, sizeof(cmd), "unignore_command_internal %s\n", user_to_ignore);
+                                        write(pipes[i][1], cmd, strlen(cmd));
                                         break;
                                     }
                                 }
@@ -77,7 +148,7 @@ void child_chat_loop(const char *channel_name, int read_fd, int initially_muted)
                 }
             }
 
-            // LOGAVIMAS
+            // LOGGING
             if (strstr(line, channel_name)) {
                 time_t now = time(NULL);
                 char *time_str = ctime(&now);
@@ -90,51 +161,81 @@ void child_chat_loop(const char *channel_name, int read_fd, int initially_muted)
                 unlock_semaphore();
             }
 
-            // AUTO pasisveikinimas
+            // JOIN GREETING
             if (!muted && strstr(line, "JOIN") && strstr(line, channel_name)) {
-                char user[128];
-                if (sscanf(line, ":%127[^!]!", user) == 1) {
+                char user[128] = {0};
+                char *user_start = strchr(line, ':');
+                char *user_end = strchr(line, '!');
+                if (user_start && user_end && (user_end > user_start)) {
+                    strncpy(user, user_start+1, user_end-(user_start+1));
+                    user[user_end-(user_start+1)] = '\0';
+                    
                     if (strstr(user, NICK) == NULL) {
-                        char message[RECV_BUFFER];
-                        snprintf(message, sizeof(message), "PRIVMSG %s :hello, %s\r\n", channel_name, user);
-                        send(sockfd, message, strlen(message), 0);
-
-                        time_t now2 = time(NULL);
-                        char *time_str = ctime(&now2);
-                        time_str[strcspn(time_str, "\n")] = 0;
-                        fprintf(logfile, "[%s] Sent hello to %s (user: %s)\n", time_str, channel_name, user);
-                        fflush(logfile);
+                        int ignored = 0;
+                        for (int j = 0; j < channels[channel_index].ignored_count; j++) {
+                            if (strcasecmp(channels[channel_index].ignored_users[j], user) == 0) {
+                                ignored = 1;
+                                break;
+                            }
+                        }
+                        
+                        if (!ignored) {
+                            char message[RECV_BUFFER];
+                            snprintf(message, sizeof(message), "PRIVMSG %s :hello, %s\r\n", 
+                                    channel_name, user);
+                            send(sockfd, message, strlen(message), 0);
+                            
+                            time_t now2 = time(NULL);
+                            char *time_str = ctime(&now2);
+                            time_str[strcspn(time_str, "\n")] = 0;
+                            fprintf(logfile, "[%s] Sent hello to %s (user: %s)\n", 
+                                   time_str, channel_name, user);
+                            fflush(logfile);
+                        } else {
+                            printf("[IGNORED-JOIN] Ignored join from %s in %s\n", 
+                                   user, channel_name);
+                        }
                     }
                 }
             }
-            // 3️⃣ ČIA ĮDEK — TIKRINIMAS AR VARTOTOJAS IGNORUOJAMAS
+
+            // AUTO-REPLY
             if (!muted && channel_index >= 0 && strstr(line, "PRIVMSG") && strstr(line, channel_name)) {
-                char user[128];
-                if (sscanf(line, ":%127[^!]!", user) == 1) {
+                char user[128] = {0};
+                char *user_start = strchr(line, ':');
+                char *user_end = strchr(line, '!');
+                if (user_start && user_end && (user_end > user_start)) {
+                    strncpy(user, user_start+1, user_end-(user_start+1));
+                    user[user_end-(user_start+1)] = '\0';
+                    
                     int ignored = 0;
                     for (int j = 0; j < channels[channel_index].ignored_count; j++) {
-                        if (strcmp(channels[channel_index].ignored_users[j], user) == 0) {
+                        if (strcasecmp(channels[channel_index].ignored_users[j], user) == 0) {
                             ignored = 1;
                             break;
                         }
                     }
+                    
                     if (ignored) {
-                        printf("[IGNORED] Ignored message from %s in %s\n", user, channel_name);
+                        printf("[IGNORED] Ignored message from %s in %s\n", 
+                               user, channel_name);
                         continue;
                     }
-                }
 
-                // AUTO-ATSAKYMAI
-                char *msg_start = strchr(line, ':');
-                if (msg_start) {
-                    msg_start++;
-                    for (int r = 0; r < response_counts[channel_index]; r++) {
-                        if (strstr(msg_start, responses[channel_index][r].trigger)) {
-                            char reply[RECV_BUFFER];
-                            snprintf(reply, sizeof(reply), "PRIVMSG %s :%s\r\n", channel_name, responses[channel_index][r].response);
-                            send(sockfd, reply, strlen(reply), 0);
-                            printf("[AUTO-REPLY] %s: %s\n", responses[channel_index][r].trigger, responses[channel_index][r].response);
-                            break;
+                    char *msg_start = strchr(line, ':');
+                    if (msg_start && (msg_start = strchr(msg_start+1, ':'))) {
+                        msg_start++; // Skip second ':'
+                        for (int r = 0; r < response_counts[channel_index]; r++) {
+                            if (strstr(msg_start, responses[channel_index][r].trigger)) {
+                                char reply[RECV_BUFFER];
+                                snprintf(reply, sizeof(reply), "PRIVMSG %s :%s\r\n", 
+                                        channel_name, responses[channel_index][r].response);
+                                send(sockfd, reply, strlen(reply), 0);
+                                printf("[AUTO-REPLY] %s: %s\n", 
+                                      responses[channel_index][r].trigger, 
+                                      responses[channel_index][r].response);
+                                break;
+                            }
                         }
                     }
                 }
