@@ -1,0 +1,146 @@
+void child_chat_loop(const char *channel_name, int read_fd, int initially_muted) {
+    int muted = initially_muted;
+    srand(getpid());
+
+    char filename[256];
+    snprintf(filename, sizeof(filename), "%s.log", channel_name + 1);
+    FILE *logfile = fopen(filename, "a");
+    if (!logfile) {
+        perror("Could not open log file");
+        exit(1);
+    }
+
+    int channel_index = -1;
+    for (int i = 0; i < channel_count; i++) {
+        if (strcmp(channels[i].name, channel_name) == 0) {
+            channel_index = i;
+            break;
+        }
+    }
+    if (channel_index >= 0 && strcmp(channels[channel_index].name, ADMIN_CHANNEL) != 0) {
+        load_responses_for_channel(channel_index);
+    }
+
+    char line[RECV_BUFFER];
+
+    while (1) {
+        int n = read(read_fd, line, sizeof(line) - 1);
+        if (n > 0) {
+            line[n] = '\0';
+
+            // MUTE / UNMUTE
+            if (strstr(line, "unmute_command_internal") && strstr(line, channel_name)) {
+                muted = 0;
+                printf("[UNMUTE] Child of %s received unmute command\n", channel_name);
+                continue;
+          }
+            if (strstr(line, "mute_command_internal") && strstr(line, channel_name)) {
+                muted = 1;
+                printf("[MUTE] Child of %s received mute command\n", channel_name);
+                continue;
+            }
+
+            // ADMIN KOMANDOS: mute/unmute/ignore/unignore
+            if (strstr(channel_name, ADMIN_CHANNEL) != NULL) {
+                char target[MAX_NAME_LEN], command[MAX_NAME_LEN], user_to_ignore[MAX_NAME_LEN];
+                if (sscanf(line, ":%*[^!]!%*[^@]@%*s PRIVMSG %*s :#%s %s %s", target, command, user_to_ignore) >= 2) {
+                    for (int i = 0; i < channel_count; i++) {
+                        if (strcmp(channels[i].name + 1, target) == 0) {
+                            Channel *ch = &channels[i];
+                            if (strcmp(command, "mute") == 0) {
+                                char cmd[128];
+                                snprintf(cmd, sizeof(cmd), "mute_command_internal #%s\n", target);
+                                write(pipes[i][1], cmd, strlen(cmd));
+                                printf("[MUTE] Sent mute command to #%s\n", target);
+                            } else if (strcmp(command, "unmute") == 0) {
+                                char cmd[128];
+                                snprintf(cmd, sizeof(cmd), "unmute_command_internal #%s\n", target);
+                                write(pipes[i][1], cmd, strlen(cmd));
+                                printf("[UNMUTE] Sent unmute command to #%s\n", target);
+                            } else if (strcmp(command, "ignore") == 0 && ch->ignored_count < MAX_IGNORED_USERS) {
+                                strncpy(ch->ignored_users[ch->ignored_count++], user_to_ignore, MAX_NAME_LEN);
+                                printf("[IGNORE] %s now ignored in #%s\n", user_to_ignore, target);
+                            } else if (strcmp(command, "unignore") == 0) {
+                                for (int j = 0; j < ch->ignored_count; j++) {
+                                    if (strcmp(ch->ignored_users[j], user_to_ignore) == 0) {
+                                        for (int k = j; k < ch->ignored_count - 1; k++) {
+                                            strncpy(ch->ignored_users[k], ch->ignored_users[k + 1], MAX_NAME_LEN);
+                                        }
+                                        ch->ignored_count--;
+                                        printf("[UNIGNORE] %s no longer ignored in #%s\n", user_to_ignore, target);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // LOGAVIMAS
+            if (strstr(line, channel_name)) {
+                time_t now = time(NULL);
+                char *time_str = ctime(&now);
+                time_str[strcspn(time_str, "\n")] = 0;
+                fprintf(logfile, "[%s] %s", time_str, line);
+                fflush(logfile);
+
+                lock_semaphore();
+                snprintf(shm_ptr, SHM_SIZE, "[%s] %s", time_str, line);
+                unlock_semaphore();
+            }
+
+            // AUTO pasisveikinimas
+            if (!muted && strstr(line, "JOIN") && strstr(line, channel_name)) {
+                char user[128];
+                if (sscanf(line, ":%127[^!]!", user) == 1) {
+                    if (strstr(user, NICK) == NULL) {
+                        char message[RECV_BUFFER];
+                        snprintf(message, sizeof(message), "PRIVMSG %s :hello, %s\r\n", channel_name, user);
+                        send(sockfd, message, strlen(message), 0);
+
+                        time_t now2 = time(NULL);
+                        char *time_str = ctime(&now2);
+                        time_str[strcspn(time_str, "\n")] = 0;
+                        fprintf(logfile, "[%s] Sent hello to %s (user: %s)\n", time_str, channel_name, user);
+                        fflush(logfile);
+                    }
+                }
+            }
+            // 3️⃣ ČIA ĮDEK — TIKRINIMAS AR VARTOTOJAS IGNORUOJAMAS
+            if (!muted && channel_index >= 0 && strstr(line, "PRIVMSG") && strstr(line, channel_name)) {
+                char user[128];
+                if (sscanf(line, ":%127[^!]!", user) == 1) {
+                    int ignored = 0;
+                    for (int j = 0; j < channels[channel_index].ignored_count; j++) {
+                        if (strcmp(channels[channel_index].ignored_users[j], user) == 0) {
+                            ignored = 1;
+                            break;
+                        }
+                    }
+                    if (ignored) {
+                        printf("[IGNORED] Ignored message from %s in %s\n", user, channel_name);
+                        continue;
+                    }
+                }
+
+                // AUTO-ATSAKYMAI
+                char *msg_start = strchr(line, ':');
+                if (msg_start) {
+                    msg_start++;
+                    for (int r = 0; r < response_counts[channel_index]; r++) {
+                        if (strstr(msg_start, responses[channel_index][r].trigger)) {
+                            char reply[RECV_BUFFER];
+                            snprintf(reply, sizeof(reply), "PRIVMSG %s :%s\r\n", channel_name, responses[channel_index][r].response);
+                            send(sockfd, reply, strlen(reply), 0);
+                            printf("[AUTO-REPLY] %s: %s\n", responses[channel_index][r].trigger, responses[channel_index][r].response);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        usleep(50000);
+    }
+    fclose(logfile);
+}
